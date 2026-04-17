@@ -132,15 +132,22 @@ DB_CONFIG = {
 }
 LAVALINK_URI = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_URI", "http://127.0.0.1:2333")
 LAVALINK_PASSWORD = os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_PASSWORD", "")
+POSITION_UPDATER_INTERVAL = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_UPDATER_INTERVAL", "10")))
+POSITION_PERSIST_INTERVAL = max(POSITION_UPDATER_INTERVAL, float(os.getenv(f"{BOT_ENV_PREFIX}_POSITION_PERSIST_INTERVAL", "15")))
+PLAYLIST_SYNC_INTERVAL = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_INTERVAL", "90")))
 
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = False
 bot = commands.Bot(command_prefix="/", intents=intents)
 bot.start_time = time.time()
 playback_tracking = {}
 guild_states = {}
 auto_heal_initialized = False
 recovering_guilds = set()
+process_queue_locks = {}
+last_position_persist = {}
+playlist_db_initialized = False
+playlist_db_lock = asyncio.Lock()
 
 ytdl_format_options = {
     'format': 'bestaudio/best', 'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -151,6 +158,7 @@ ytdl_format_options = {
 
 # --- DATABASE INITIALIZATION ---
 async def init_db():
+    global playlist_db_initialized
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -161,6 +169,26 @@ async def init_db():
                 await cur.execute("CREATE TABLE IF NOT EXISTS symphony_queue (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, bot_name VARCHAR(50), video_url TEXT, title TEXT, requester_id BIGINT DEFAULT NULL)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS symphony_history (id INT AUTO_INCREMENT PRIMARY KEY, guild_id BIGINT, video_url TEXT, title TEXT, played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, requester_id BIGINT DEFAULT NULL)")
                 await cur.execute("CREATE TABLE IF NOT EXISTS symphony_user_playlists (id INT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT, playlist_name VARCHAR(255), video_url TEXT, title TEXT)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_active_playlists (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))")
+                try: await cur.execute("ALTER TABLE symphony_active_playlists ADD COLUMN channel_id BIGINT DEFAULT NULL")
+                except: pass
+                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), PRIMARY KEY(guild_id, bot_name))")
+                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT, text_channel_id BIGINT, command VARCHAR(50), data TEXT)")
+                await cur.execute("CREATE TABLE IF NOT EXISTS swarm_health (bot_name VARCHAR(50) PRIMARY KEY, last_pulse TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, status VARCHAR(20))")
+                try: await cur.execute("CREATE INDEX symphony_queue_lookup_idx ON symphony_queue (guild_id, bot_name, id)")
+                except: pass
+                try: await cur.execute("CREATE INDEX symphony_history_guild_played_idx ON symphony_history (guild_id, played_at)")
+                except: pass
+                try: await cur.execute("CREATE INDEX symphony_history_requester_idx ON symphony_history (guild_id, requester_id, played_at)")
+                except: pass
+                try: await cur.execute("CREATE INDEX symphony_playback_resume_idx ON symphony_playback_state (bot_name, is_playing, guild_id)")
+                except: pass
+                try: await cur.execute("CREATE INDEX symphony_playlist_bot_idx ON symphony_active_playlists (bot_name, guild_id)")
+                except: pass
+                try: await cur.execute("CREATE INDEX symphony_user_playlist_lookup_idx ON symphony_user_playlists (user_id, playlist_name)")
+                except: pass
+                playlist_db_initialized = True
                 logger.info("Database tables verified/created for SYMPHONY.")
 
 # --- CORE LOGIC & HELPERS ---
@@ -204,6 +232,16 @@ def _scalar_from_row(row, default=0):
         return row[0] if row else default
     return row
 
+def get_process_queue_lock(guild_id):
+    lock = process_queue_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        process_queue_locks[guild_id] = lock
+    return lock
+
+def invalidate_position_persist(guild_id):
+    last_position_persist.pop(guild_id, None)
+
 async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, title, requester_id, max_attempts=5):
     if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         raise ValueError(f"Unsafe table name: {table_name}")
@@ -228,7 +266,6 @@ async def get_home_channel(guild):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("SELECT home_vc_id FROM symphony_bot_home_channels WHERE guild_id = %s AND bot_name = 'symphony'", (guild.id,))
                 res = await cur.fetchone()
     if res and res[0]:
@@ -370,7 +407,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         coro = process_queue(payload.player.guild, payload.player.channel.id)
         bot.loop.create_task(coro)
 
-async def process_queue(guild, channel_id, start_position=0):
+async def _process_queue_inner(guild, channel_id, start_position=0):
     recovering_guilds.discard(guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -386,6 +423,7 @@ async def process_queue(guild, channel_id, start_position=0):
                     await cur.execute("UPDATE symphony_playback_state SET is_playing = FALSE WHERE guild_id = %s AND bot_name = 'symphony'", (guild.id,))
                     playback_tracking.pop(guild.id, None)
                     guild_states.pop(guild.id, None)
+                    invalidate_position_persist(guild.id)
                     await delete_state(guild.id)
                     await bot.change_presence(status=discord.Status.online)
                     
@@ -467,17 +505,26 @@ async def process_queue(guild, channel_id, start_position=0):
                 
                 # Update persistent state
                 guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position}
+                invalidate_position_persist(guild.id)
                 await save_state(guild.id)
 
                 embed = discord.Embed(title="🎵 Now Playing", description=f"**[{title}]({url})**\n*By: {uploader}*", color=discord.Color.from_rgb(88, 101, 242))
                 if requester_id: embed.add_field(name="Requested by", value=f"<@{requester_id}>", inline=True)
                 await send_feedback(guild, embed)
 
+async def process_queue(guild, channel_id, start_position=0):
+    lock = get_process_queue_lock(guild.id)
+    async with lock:
+        if guild.voice_client and (getattr(guild.voice_client, 'playing', False) or getattr(guild.voice_client, 'paused', False)):
+            return
+        return await _process_queue_inner(guild, channel_id, start_position=start_position)
+
 async def stop_playback(guild):
     if guild.voice_client: await guild.voice_client.disconnect()
     playback_tracking.pop(guild.id, None)
     guild_states.pop(guild.id, None)
     recovering_guilds.discard(guild.id)
+    invalidate_position_persist(guild.id)
     await delete_state(guild.id)
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -588,19 +635,25 @@ async def on_voice_state_update(member, before, after):
         playback_tracking.pop(member.guild.id, None)
         guild_states.pop(member.guild.id, None)
         recovering_guilds.discard(member.guild.id)
+        invalidate_position_persist(member.guild.id)
         await delete_state(member.guild.id)
         pending_voice_channels.pop(member.guild.id, None)
 
-@tasks.loop(seconds=5.0)
+@tasks.loop(seconds=POSITION_UPDATER_INTERVAL)
 async def position_updater():
+    now = time.time()
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 for guild_id, data in list(playback_tracking.items()):
+                    last_persist = last_position_persist.get(guild_id, 0)
+                    if now - last_persist < POSITION_PERSIST_INTERVAL:
+                        continue
                     guild = bot.get_guild(guild_id)
                     if guild and guild.voice_client and getattr(guild.voice_client, 'playing', False):
                         pos = int((time.time() - data['start_time']) * data.get('speed', 1.0) + data['offset'])
                         await cur.execute("REPLACE INTO symphony_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, title) VALUES (%s, 'symphony', %s, %s, %s, TRUE, %s)", (guild_id, data['channel_id'], data['url'], pos, data['title']))
+                        last_position_persist[guild_id] = now
 
 # --- SETTINGS COMMANDS ---
 @bot.tree.command(name="symphony_main_sethome", description="Set bot's default voice/stage channel")
@@ -609,7 +662,6 @@ async def sethome(interaction: discord.Interaction, channel: discord.VoiceChanne
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("REPLACE INTO symphony_bot_home_channels (guild_id, bot_name, home_vc_id) VALUES (%s, %s, %s)", (interaction.guild.id, 'symphony', channel.id))
     await interaction.response.send_message(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
@@ -702,7 +754,6 @@ async def play(interaction: discord.Interaction, search: str):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("SELECT home_vc_id FROM symphony_bot_home_channels WHERE guild_id = %s AND bot_name = 'symphony'", (interaction.guild.id,))
                 res = await cur.fetchone()
                 if res and res[0]: channel = interaction.guild.get_channel(res[0])
@@ -817,6 +868,7 @@ async def clear(interaction: discord.Interaction):
         except Exception: pass
     playback_tracking.pop(interaction.guild.id, None)
     guild_states.pop(interaction.guild.id, None)
+    invalidate_position_persist(interaction.guild.id)
     await delete_state(interaction.guild.id)
     await clear_active_playlist(interaction.guild.id)
     async with DBPoolManager() as pool:
@@ -835,7 +887,6 @@ async def join(interaction: discord.Interaction):
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS symphony_bot_home_channels (guild_id BIGINT, bot_name VARCHAR(50), home_vc_id BIGINT, PRIMARY KEY (guild_id, bot_name))")
                 await cur.execute("SELECT home_vc_id FROM symphony_bot_home_channels WHERE guild_id = %s AND bot_name = 'symphony'", (interaction.guild.id,))
                 res = await cur.fetchone()
                 if res and res[0]: channel = interaction.guild.get_channel(res[0])
@@ -1121,6 +1172,7 @@ async def seek(interaction: discord.Interaction, seconds: int):
         await interaction.guild.voice_client.seek(seconds * 1000)
         playback_tracking[interaction.guild.id]['offset'] = seconds
         playback_tracking[interaction.guild.id]['start_time'] = time.time()
+        invalidate_position_persist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"Seeked to {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="symphony_main_forward", description="Skip forward X seconds")
@@ -1134,6 +1186,7 @@ async def forward(interaction: discord.Interaction, seconds: int):
         await interaction.guild.voice_client.seek(new_pos * 1000)
         playback_tracking[interaction.guild.id]['offset'] = new_pos
         playback_tracking[interaction.guild.id]['start_time'] = time.time()
+        invalidate_position_persist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"Skipped forward {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="symphony_main_rewind", description="Rewind X seconds")
@@ -1147,6 +1200,7 @@ async def rewind(interaction: discord.Interaction, seconds: int):
         await interaction.guild.voice_client.seek(new_pos * 1000)
         playback_tracking[interaction.guild.id]['offset'] = new_pos
         playback_tracking[interaction.guild.id]['start_time'] = time.time()
+        invalidate_position_persist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"Rewound {seconds}s", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="symphony_main_replay", description="Restart current song")
@@ -1157,6 +1211,7 @@ async def replay(interaction: discord.Interaction):
         await interaction.guild.voice_client.seek(0)
         playback_tracking[interaction.guild.id]['offset'] = 0
         playback_tracking[interaction.guild.id]['start_time'] = time.time()
+        invalidate_position_persist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description="Replaying song.", color=discord.Color.green()), ephemeral=True)
 
 # --- UTILITY & INFO ---
@@ -1199,6 +1254,7 @@ async def panel(interaction: discord.Interaction):
                 await i.guild.voice_client.seek(new_pos * 1000)
                 playback_tracking[i.guild.id]['offset'] = new_pos
                 playback_tracking[i.guild.id]['start_time'] = time.time()
+                invalidate_position_persist(i.guild.id)
             await i.response.send_message("Rewound 10 seconds.", ephemeral=True)
         @discord.ui.button(label="⏩ +10s", style=discord.ButtonStyle.secondary, row=1)
         async def fw(self, i: discord.Interaction, b: discord.ui.Button):
@@ -1211,6 +1267,7 @@ async def panel(interaction: discord.Interaction):
                 await i.guild.voice_client.seek(new_pos * 1000)
                 playback_tracking[i.guild.id]['offset'] = new_pos
                 playback_tracking[i.guild.id]['start_time'] = time.time()
+                invalidate_position_persist(i.guild.id)
             await i.response.send_message("Skipped forward 10 seconds.", ephemeral=True)
         @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.success, row=2)
         async def shuf(self, i: discord.Interaction, b: discord.ui.Button):
@@ -1287,12 +1344,21 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 
 # --- LIVE PLAYLIST SYNC FEATURE ---
 async def init_playlist_db():
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute('''CREATE TABLE IF NOT EXISTS symphony_active_playlists (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))''')
-                try: await cur.execute("ALTER TABLE symphony_active_playlists ADD COLUMN channel_id BIGINT DEFAULT NULL")
-                except: pass
+    global playlist_db_initialized
+    if playlist_db_initialized:
+        return
+    async with playlist_db_lock:
+        if playlist_db_initialized:
+            return
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute('''CREATE TABLE IF NOT EXISTS symphony_active_playlists (guild_id BIGINT, bot_name VARCHAR(50), playlist_url TEXT, known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT DEFAULT NULL, PRIMARY KEY (guild_id, bot_name))''')
+                    try: await cur.execute("ALTER TABLE symphony_active_playlists ADD COLUMN channel_id BIGINT DEFAULT NULL")
+                    except: pass
+                    try: await cur.execute("CREATE INDEX symphony_playlist_bot_idx ON symphony_active_playlists (bot_name, guild_id)")
+                    except: pass
+        playlist_db_initialized = True
 
 def resolve_playlist_source(search, playlist=None):
     candidates = [getattr(playlist, 'url', None), getattr(playlist, 'uri', None), search]
@@ -1319,7 +1385,7 @@ async def clear_active_playlist(guild_id):
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM symphony_active_playlists WHERE guild_id = %s AND bot_name = 'symphony'", (guild_id,))
 
-@tasks.loop(seconds=30.0)
+@tasks.loop(seconds=PLAYLIST_SYNC_INTERVAL)
 async def playlist_sync_loop():
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
@@ -1384,7 +1450,6 @@ async def aria_command_listener():
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("CREATE TABLE IF NOT EXISTS symphony_swarm_overrides (guild_id BIGINT, bot_name VARCHAR(50), command VARCHAR(20), PRIMARY KEY(guild_id, bot_name))")
                     await cur.execute("SELECT guild_id, command FROM symphony_swarm_overrides WHERE bot_name = %s", ('symphony',))
                     commands = await cur.fetchall()
 
@@ -1493,7 +1558,6 @@ async def direct_order_listener():
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("CREATE TABLE IF NOT EXISTS symphony_swarm_direct_orders (id INT AUTO_INCREMENT PRIMARY KEY, bot_name VARCHAR(50), guild_id BIGINT, vc_id BIGINT, text_channel_id BIGINT, command VARCHAR(50), data TEXT)")
                     await cur.execute("SELECT * FROM symphony_swarm_direct_orders WHERE bot_name = %s", ('symphony',))
                     orders = await cur.fetchall()
 
@@ -1605,7 +1669,6 @@ class SwarmIntelligence(commands.Cog):
             async with DBPoolManager() as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("CREATE TABLE IF NOT EXISTS swarm_health (bot_name VARCHAR(50) PRIMARY KEY, last_pulse TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, status VARCHAR(20))")
                         await cur.execute("REPLACE INTO swarm_health (bot_name, status) VALUES (%s, 'HEALTHY')", (self.bot_name,))
         except: pass
 
