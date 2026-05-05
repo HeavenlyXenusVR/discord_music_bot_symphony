@@ -461,6 +461,7 @@ MAX_RECOVERY_RETRIES = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_MAX_RECOVERY_RETR
 WATCHDOG_REVIVAL_COOLDOWN = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_REVIVAL_COOLDOWN", "15")))
 WATCHDOG_MAX_REVIVALS = max(3, int(os.getenv(f"{BOT_ENV_PREFIX}_WATCHDOG_MAX_REVIVALS", "6")))
 AUTO_RESTORE_SNOOZE_SECONDS = max(60.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_RESTORE_SNOOZE_SECONDS", "180")))
+PERIODIC_RESTART_HOURS = max(1.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PERIODIC_RESTART_HOURS", os.getenv("PERIODIC_RESTART_HOURS", "5"))))
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -501,6 +502,22 @@ def schedule_named_task(name, coro):
 
     task.add_done_callback(_cleanup)
     return task
+
+
+async def request_supervisor_restart(reason: str, *, announce: bool = True):
+    logger.warning("[%s] Restart requested (%s); exiting for container supervisor restart.", BOT_ENV_PREFIX.lower(), reason)
+    if announce:
+        try:
+            await send_webhook_log(
+                bot.user.name if bot.user else BOT_ENV_PREFIX.capitalize(),
+                "♻️ Node Restart",
+                f"This node is restarting for **{reason.replace('_', ' ')}**. Docker will bring it back online automatically.",
+                discord.Color.orange(),
+            )
+        except Exception:
+            logger.debug("[%s] Failed to publish restart webhook.", BOT_ENV_PREFIX.lower(), exc_info=True)
+    await bot.close()
+    sys.exit(0)
 
 
 vote_skip_sessions = {}
@@ -1956,8 +1973,7 @@ async def toggle_247(interaction: discord.Interaction):
 @commands.has_permissions(administrator=True)
 async def restart_bot(interaction: discord.Interaction):
     await interaction.response.send_message("Restarting...", ephemeral=True)
-    await bot.close()
-    sys.exit(0)
+    await request_supervisor_restart("admin_slash_command", announce=False)
 
 # --- COMMAND SURFACE: slash handlers should stay thin and delegate to runtime helpers above. ---
 # --- PLAYBACK COMMANDS ---
@@ -2882,13 +2898,11 @@ async def aria_command_listener():
             attempts = int(row.get('attempts', 0) or 0)
 
             if cmd == 'RESTART':
-                logger.warning("[symphony] Restart override received; exiting for container supervisor restart.")
                 async with DBPoolManager() as pool:
                     async with pool.acquire() as conn:
                         async with conn.cursor() as cur:
                             await cur.execute("DELETE FROM symphony_swarm_overrides WHERE guild_id = %s AND bot_name = %s", (guild_id, 'symphony'))
-                await bot.close()
-                sys.exit(0)
+                await request_supervisor_restart("aria_override")
 
             guild = bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
@@ -3082,11 +3096,16 @@ async def database_janitor_loop():
     except Exception as e:
         logger.error(f"Janitor Error: {e}")
 
+@tasks.loop(hours=PERIODIC_RESTART_HOURS)
+async def periodic_restart_loop():
+    await request_supervisor_restart(f"periodic_{PERIODIC_RESTART_HOURS:g}h_cycle")
+
 @bot.event
 async def on_ready_maintenance():
     if not resilience_loop.is_running(): resilience_loop.start()
     if not zombie_reaper_loop.is_running(): zombie_reaper_loop.start()
     if not database_janitor_loop.is_running(): database_janitor_loop.start()
+    if not periodic_restart_loop.is_running(): periodic_restart_loop.start()
 bot.add_listener(on_ready_maintenance, 'on_ready')
 
 # --- ARIA DIRECT DRONE CONTROL ---
