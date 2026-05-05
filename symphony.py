@@ -504,6 +504,10 @@ def schedule_named_task(name, coro):
     """Prevent duplicate startup/recovery tasks across reconnecting on_ready events."""
     existing = startup_task_registry.get(name)
     if existing and not existing.done():
+        try:
+            coro.close()
+        except Exception:
+            pass
         return existing
     task = asyncio.create_task(coro)
     startup_task_registry[name] = task
@@ -840,6 +844,15 @@ def _scalar_from_row(row, default=0):
         return row[0] if row else default
     return row
 
+def _row_value(row, key_or_index, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key_or_index, default)
+    if isinstance(key_or_index, int) and isinstance(row, (tuple, list)):
+        return row[key_or_index] if len(row) > key_or_index else default
+    return default
+
 def get_process_queue_lock(guild_id):
     lock = process_queue_locks.get(guild_id)
     if lock is None:
@@ -1099,7 +1112,7 @@ async def insert_queue_front(cur, table_name, guild_id, bot_name, video_url, tit
         raise ValueError(f"Unsafe table name: {table_name}")
 
     for attempt in range(max_attempts):
-        await cur.execute(f"SELECT COALESCE(MIN(id), 0) AS min_id FROM {table_name} WHERE guild_id = %s AND bot_name = %s", (guild_id, bot_name))
+        await cur.execute(f"SELECT COALESCE(MIN(id), 0) AS min_id FROM {table_name}")
         min_row = await cur.fetchone()
         new_id = (_scalar_from_row(min_row, 0) or 0) - 1
         try:
@@ -1155,7 +1168,10 @@ async def restore_queue_from_backup(cur, guild_id, requester_id=None):
         return 0
 
     restored = 0
-    for url, title, backup_requester_id in rows:
+    for row in rows:
+        url = _row_value(row, "video_url", _row_value(row, 0))
+        title = _row_value(row, "title", _row_value(row, 1))
+        backup_requester_id = _row_value(row, "requester_id", _row_value(row, 2))
         await cur.execute(
             "INSERT INTO symphony_queue (guild_id, bot_name, video_url, title, requester_id) VALUES (%s, 'symphony', %s, %s, %s)",
             (guild_id, url, title, requester_id if requester_id is not None else backup_requester_id),
@@ -1176,13 +1192,14 @@ async def restore_active_playback_entry(cur, guild_id, requester_id=None):
     if not row:
         return 0
 
-    video_url, title = row
+    video_url = _row_value(row, "video_url", _row_value(row, 0))
+    title = _row_value(row, "title", _row_value(row, 1))
     await cur.execute(
         "SELECT video_url FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony' ORDER BY id ASC LIMIT 1",
         (guild_id,),
     )
     existing = await cur.fetchone()
-    existing_url = existing[0] if existing else None
+    existing_url = _row_value(existing, "video_url", _row_value(existing, 0))
     if existing_url and str(existing_url).strip() == str(video_url).strip():
         return 0
 
@@ -3119,6 +3136,11 @@ async def database_janitor_loop():
 @tasks.loop(hours=PERIODIC_RESTART_HOURS)
 async def periodic_restart_loop():
     await request_supervisor_restart(f"periodic_{PERIODIC_RESTART_HOURS:g}h_cycle")
+
+@periodic_restart_loop.before_loop
+async def before_periodic_restart_loop():
+    await bot.wait_until_ready()
+    await asyncio.sleep(PERIODIC_RESTART_HOURS * 60 * 60)
 
 @bot.event
 async def on_ready_maintenance():
