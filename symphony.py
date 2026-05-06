@@ -1316,14 +1316,18 @@ async def update_stage_topic(guild, title, requester_id):
             except Exception as e:
                 logger.warning(f"[{guild.id}] Stage topic update failed: {e}")
 
-        try:
-            await channel.edit(status=voice_status)
-        except TypeError:
-            pass
-        except discord.Forbidden:
-            logger.warning(f"[{guild.id}] Missing Manage Channels permission to update voice channel status.")
-        except Exception as e:
-            logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
+        if not isinstance(channel, discord.StageChannel):
+            try:
+                await channel.edit(status=voice_status)
+            except TypeError:
+                pass
+            except discord.Forbidden:
+                logger.warning(f"[{guild.id}] Missing Manage Channels permission to update voice channel status.")
+            except discord.HTTPException as e:
+                if getattr(e, "code", None) != 50024:
+                    logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
+            except Exception as e:
+                logger.warning(f"[{guild.id}] Voice channel status update failed: {e}")
     except Exception as e:
         logger.error(f"[STAGE/VOICE STATUS ERROR] {e}")
 
@@ -1405,6 +1409,21 @@ async def ensure_voice_connection(guild, channel_id):
     voice_client = guild.voice_client
     pending_voice_channels[guild.id] = channel_id
     try:
+        if voice_client and (
+            not _voice_client_connected(voice_client)
+            or (
+                recovery_retry_counts.get(guild.id)
+                and getattr(voice_client, "channel", None)
+                and voice_client.channel.id == channel_id
+                and not _player_is_active(voice_client)
+            )
+        ):
+            try:
+                await voice_client.disconnect()
+            except Exception:
+                pass
+            voice_client = None
+
         if not voice_client:
             voice_client = await channel.connect(cls=wavelink.Player, timeout=60.0)
         elif voice_client.channel.id != channel_id:
@@ -1532,13 +1551,25 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                 await cur.execute("DELETE FROM symphony_queue WHERE id = %s AND guild_id = %s AND bot_name = 'symphony'", (song_id, guild.id))
 
                 try:
-                    entries, _playlist_result = await search_playables(url)
-                    if not entries: raise ValueError("No stream found.")
-                    track = entries[0]
+                    track, resolved_source = await resolve_queue_track(url, title)
                     duration = track.length / 1000
                     uploader = track.author
+                    if resolved_source != url:
+                        logger.info(f"[{guild.id}] Recovered '{title}' using alternate source {resolved_source}.")
+                        url = track.uri
+                        title = track.title
                 except Exception as e:
                     logger.error(f"[{guild.id}] Lavalink search failed for '{title}': {e}")
+                    if _is_direct_media_url(url):
+                        playback_tracking.pop(guild.id, None)
+                        await cur.execute(
+                            "UPDATE symphony_playback_state SET video_url = NULL, title = NULL, is_playing = FALSE, is_paused = FALSE, position_seconds = 0 WHERE guild_id = %s AND bot_name = 'symphony'",
+                            (guild.id,),
+                        )
+                        await remember_recovery_state(guild.id, channel_id, 0)
+                        clear_recovery_retry(guild.id)
+                        schedule_named_task(f"skip_unavailable:{guild.id}", process_queue(guild, channel_id))
+                        return
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="search_failure")
                     return
 
@@ -1573,6 +1604,11 @@ async def _process_queue_inner(guild, channel_id, start_position=0):
                         await voice_client.set_volume(0)
                 except Exception as e:
                     logger.error(f"[{guild.id}] Player preparation failed for '{title}': {e}")
+                    if _is_stale_lavalink_player_error(e) and guild.voice_client:
+                        try:
+                            await guild.voice_client.disconnect()
+                        except Exception:
+                            logger.debug(f"[{guild.id}] Failed to recycle stale Lavalink player cleanly.", exc_info=True)
                     await requeue_failed_track(cur, guild.id, channel_id, url, title, requester_id, position=start_position, reason="player_prepare")
                     return
 
@@ -2842,6 +2878,57 @@ async def search_playables(query):
     results = await wavelink.Playable.search(cleaned)
     return unwrap_search_results(results)
 
+def _is_direct_media_url(value):
+    text = str(value or "").strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+def _build_track_title_search(title):
+    cleaned = re.sub(r"\s+", " ", str(title or "").strip())
+    return f"ytsearch:{cleaned}" if cleaned else None
+
+async def _expand_media_url(url):
+    candidate = str(url or "").strip()
+    if not _is_direct_media_url(candidate):
+        return candidate
+    if not any(host in candidate for host in ("on.soundcloud.com", "soundcloud.app.goo.gl", "youtu.be", "music.youtube.com")):
+        return candidate
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with HTTPSessionManager() as session:
+            async with session.get(candidate, allow_redirects=True, timeout=timeout) as response:
+                return str(response.url)
+    except Exception:
+        return candidate
+
+async def resolve_queue_track(source, fallback_title=None):
+    candidate = await _expand_media_url(source)
+    attempts = [candidate]
+    title_search = _build_track_title_search(fallback_title)
+    if title_search and _is_direct_media_url(candidate):
+        attempts.append(title_search)
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            entries, _playlist_result = await search_playables(attempt)
+            if entries:
+                return entries[0], attempt
+            last_error = ValueError("No stream found.")
+        except Exception as exc:
+            last_error = exc
+
+    if last_error:
+        raise last_error
+    raise ValueError("No stream found.")
+
+def _is_stale_lavalink_player_error(error):
+    text = str(error or "").lower()
+    return (
+        "failed to fulfill request to lavalink" in text
+        and "status=404" in text
+        and "/players/" in text
+    )
+
 async def set_active_playlist(guild_id, playlist_url, known_track_count, requester_id, channel_id):
     if not playlist_url:
         return
@@ -3350,6 +3437,8 @@ class SwarmIntelligence(commands.Cog):
                 await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\n", " ").strip()[:120]))
                 return
             await self.bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="the Swarm | Idle"))
+        except (aiohttp.ClientConnectionResetError, ConnectionResetError):
+            logger.debug("[%s] Presence update skipped while the gateway transport was closing.", self.bot_name)
         except Exception:
             logger.exception("[%s] Status updater failed.", self.bot_name)
 
