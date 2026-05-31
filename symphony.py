@@ -3278,6 +3278,7 @@ async def collect_and_persist_metrics(guild=None):
         async with DBPoolManager() as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
+                    metrics_rows = []
                     for g in guilds:
                         if not g:
                             continue
@@ -3311,7 +3312,25 @@ async def collect_and_persist_metrics(guild=None):
                                 "UPDATE symphony_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'symphony'",
                                 (channel_id, player_playing, player_paused, int(live_position or metrics_row.get("position_seconds") or 0), g.id),
                             )
-                        await cur.execute(
+                        metrics_rows.append((
+                            g.id,
+                            voice_connected,
+                            channel_id,
+                            voice_connected,
+                            player_playing,
+                            player_paused,
+                            int(metrics_row.get("queue_total") or 0),
+                            int(metrics_row.get("backup_total") or 0),
+                            bool(metrics_row.get("is_playing")) if voice_connected else False,
+                            bool(metrics_row.get("is_paused")) if voice_connected else False,
+                            int(live_position or metrics_row.get("position_seconds") or 0),
+                            live_duration,
+                            g.id in recovering_guilds or str(g.id) in guild_states,
+                            bool(lavalink_ready),
+                            metrics_last_errors.get(g.id),
+                        ))
+                    if metrics_rows:
+                        await cur.executemany(
                             """
                             REPLACE INTO symphony_metrics
                                 (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
@@ -3319,23 +3338,7 @@ async def collect_and_persist_metrics(guild=None):
                                  heartbeat_age_seconds, lavalink_ready, last_error)
                             VALUES (%s, 'symphony', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s)
                             """,
-                            (
-                                g.id,
-                                voice_connected,
-                                channel_id,
-                                voice_connected,
-                                player_playing,
-                                player_paused,
-                                int(metrics_row.get("queue_total") or 0),
-                                int(metrics_row.get("backup_total") or 0),
-                                bool(metrics_row.get("is_playing")) if voice_connected else False,
-                                bool(metrics_row.get("is_paused")) if voice_connected else False,
-                                int(live_position or metrics_row.get("position_seconds") or 0),
-                                live_duration,
-                                g.id in recovering_guilds or str(g.id) in guild_states,
-                                bool(lavalink_ready),
-                                metrics_last_errors.get(g.id),
-                            ),
+                            metrics_rows,
                         )
     except Exception as exc:
         logger.exception("[symphony] Metrics collection failed: %s", exc)
@@ -4547,6 +4550,14 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
     last_reported = None
     expected_identity = _track_instance_identity(track_uid, video_url, title)
 
+    # Issue an explicit seek immediately — the start= parameter to play() is unreliable
+    # for deep positions on YouTube streams. This mirrors what the manual /seek command does.
+    try:
+        await asyncio.sleep(0.5)  # brief pause for Lavalink to accept the new player
+        await voice_client.seek(target_ms)
+    except Exception:
+        pass
+
     for attempt in range(1, max_attempts + 1):
         if expected_identity and guild_id in playback_tracking and float(playback_tracking[guild_id].get("last_user_seek_at", 0.0)) > (time.monotonic() - 5.0): return start_position
         try:
@@ -4567,7 +4578,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
             last_reported = normalize_position_seconds(reported)
             if last_reported + RESUME_SEEK_VERIFY_GRACE_SECONDS >= start_position:
                 return max(start_position, last_reported)
-        if attempt > 1: await voice_client.seek(target_ms)
+        await voice_client.seek(target_ms)  # re-seek on every verification attempt
         if attempt == 1 and max_attempts > 1:
             logger.warning(
                 "[%s] Resume seek verification saw player at %s after asking for %ss; retrying seek.",
@@ -5695,40 +5706,61 @@ async def restore_guild_state(guild_id, state, *, override_backoff=False):
         if not handoff:
             recovering_guilds.discard(target_guild_id)
 
+async def _drsd_fetch_playback(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
+                "FROM symphony_playback_state WHERE guild_id = %s AND bot_name = 'symphony' LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_home(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT home_vc_id FROM symphony_bot_home_channels WHERE guild_id = %s AND bot_name = 'symphony' LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_voice(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COALESCE(connected_channel_id, last_channel_id) FROM symphony_voice_state WHERE guild_id = %s AND bot_name = 'symphony' AND desired_connected = TRUE LIMIT 1",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_queue_count(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony'",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
+async def _drsd_fetch_backup_count(pool, guild_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM symphony_queue_backup WHERE guild_id = %s AND bot_name = 'symphony'",
+                (guild_id,),
+            )
+            return await cur.fetchone()
+
 async def derive_recovery_state_from_db(guild_id):
     async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT channel_id, position_seconds, is_playing, video_url, title, track_uid "
-                    "FROM symphony_playback_state WHERE guild_id = %s AND bot_name = 'symphony' LIMIT 1",
-                    (guild_id,),
-                )
-                playback = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT home_vc_id FROM symphony_bot_home_channels WHERE guild_id = %s AND bot_name = 'symphony' LIMIT 1",
-                    (guild_id,),
-                )
-                home_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COALESCE(connected_channel_id, last_channel_id) FROM symphony_voice_state WHERE guild_id = %s AND bot_name = 'symphony' AND desired_connected = TRUE LIMIT 1",
-                    (guild_id,),
-                )
-                voice_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COUNT(*) FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony'",
-                    (guild_id,),
-                )
-                queue_row = await cur.fetchone()
-
-                await cur.execute(
-                    "SELECT COUNT(*) FROM symphony_queue_backup WHERE guild_id = %s AND bot_name = 'symphony'",
-                    (guild_id,),
-                )
-                backup_row = await cur.fetchone()
+        playback, home_row, voice_row, queue_row, backup_row = await asyncio.gather(
+            _drsd_fetch_playback(pool, guild_id),
+            _drsd_fetch_home(pool, guild_id),
+            _drsd_fetch_voice(pool, guild_id),
+            _drsd_fetch_queue_count(pool, guild_id),
+            _drsd_fetch_backup_count(pool, guild_id),
+        )
 
     playback_channel_id = playback[0] if playback and playback[0] else None
     playback_position = playback[1] if playback and playback[1] is not None else 0
