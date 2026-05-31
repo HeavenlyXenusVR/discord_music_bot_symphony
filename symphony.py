@@ -5182,6 +5182,23 @@ def _should_auto_disconnect(guild, stay_in_vc=False):
     if stay_in_vc: return False
     return not _has_human_listeners(guild.voice_client)
 
+async def _record_track_outcome_parallel(pool, guild_id, track_uri, track_title, original_requester, outcome, listen_seconds):
+    """Run record_track_outcome on its own connection so it can be gathered with the loop_mode SELECT."""
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await record_track_outcome(
+                    cur,
+                    guild_id,
+                    track_uri,
+                    track_title,
+                    original_requester,
+                    outcome=outcome,
+                    listen_seconds=listen_seconds,
+                )
+    except Exception:
+        logger.debug("[%s] Track intelligence outcome write skipped (parallel).", guild_id, exc_info=True)
+
 @bot.event
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = getattr(payload, "player", None)
@@ -5204,35 +5221,29 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                 return
 
         if track:
+            # Collect all in-memory data before touching the DB.
+            track_data = playback_tracking.get(guild.id, {})
+            original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
+            track_uri = getattr(track, 'uri', None) or track_data.get('url')
+            track_title = getattr(track, 'title', None) or track_data.get('title')
+            resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
+            if reason == "FINISHED":
+                final_position = int(track_data.get('duration') or current_track_position(guild.id) or 0)
+            else:
+                final_position = int(current_track_position(guild.id) or track_data.get('last_position_checkpoint') or 0)
+            listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
+            outcome = "finished" if reason == "FINISHED" else "skipped"
+
             async with DBPoolManager() as pool:
+                # SELECT loop_mode and record_track_outcome write are independent —
+                # run them in parallel on separate pool connections.
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT loop_mode FROM symphony_guild_settings WHERE guild_id = %s", (guild.id,))
+                        loop_mode_coro = cur.execute("SELECT loop_mode FROM symphony_guild_settings WHERE guild_id = %s", (guild.id,))
+                        outcome_coro = _record_track_outcome_parallel(pool, guild.id, track_uri, track_title, original_requester, outcome, listen_seconds)
+                        await asyncio.gather(loop_mode_coro, outcome_coro)
                         mode_row = await cur.fetchone()
                         loop_mode = mode_row[0] if mode_row and mode_row[0] else 'queue'
-                        track_data = playback_tracking.get(guild.id, {})
-                        original_requester = track_data.get('requester_id', bot.user.id if bot.user else None)
-                        track_uri = getattr(track, 'uri', None) or track_data.get('url')
-                        track_title = getattr(track, 'title', None) or track_data.get('title')
-                        resolved_track_uid = track_data.get("track_uid") or _track_uid_from_obj(track)
-
-                        try:
-                            if reason == "FINISHED":
-                                final_position = int(track_data.get('duration') or current_track_position(guild.id) or 0)
-                            else:
-                                final_position = int(current_track_position(guild.id) or track_data.get('last_position_checkpoint') or 0)
-                            listen_seconds = consume_realtime_listen_delta(track_data, final_position, playing=True) if track_data else max(0, final_position)
-                            await record_track_outcome(
-                                cur,
-                                guild.id,
-                                track_uri,
-                                track_title,
-                                original_requester,
-                                outcome="finished" if reason == "FINISHED" else "skipped",
-                                listen_seconds=listen_seconds,
-                            )
-                        except Exception as tx_error:
-                            logger.debug("[%s] Track intelligence outcome write skipped.", guild.id, exc_info=True)
 
                         if reason == "FINISHED":
                             clear_track_failure(guild.id, track_uri, track_title)
