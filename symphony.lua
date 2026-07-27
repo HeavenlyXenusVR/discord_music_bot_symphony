@@ -2367,7 +2367,16 @@ end
 -- way back in short of a manual /play.
 bot.gateway:on("READY", function()
   copas.addthread(function()
-    copas.sleep(2) -- let the gateway session settle before opening voice
+    -- Wait for the Lavalink websocket to actually be connected before
+    -- touching the queue -- process_queue deletes each row before resolving
+    -- it, so racing this against Lavalink's own (often slow, cold-start)
+    -- connect meant every "no response from Lavalink" failure permanently
+    -- destroyed that queued track instead of just skipping playback.
+    local waited = 0
+    while not (bot.lavalink and bot.lavalink.session_id) and waited < 60 do
+      copas.sleep(1)
+      waited = waited + 1
+    end
     local rows = Q("SELECT DISTINCT guild_id FROM symphony_bot_home_channels WHERE bot_name = 'symphony'") or {}
     for _, row in ipairs(rows) do
       local gid = row.guild_id
