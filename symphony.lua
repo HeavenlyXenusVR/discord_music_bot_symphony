@@ -797,6 +797,55 @@ local function join_and_wait_for_voice(guild_id, channel_id)
   copas.sleep(0.4) -- give VOICE_SERVER_UPDATE -> Lavalink a moment to land
 end
 
+-- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
+-- this, a stage channel just sits showing "waiting" in Discord's UI and the
+-- member list never shows what's playing, even though audio is flowing fine
+-- -- these are purely cosmetic Discord-side signals, not required for audio,
+-- but users expect them. Channel type is memoized since it never changes.
+local channel_kind_cache = {} -- channel_id -> "stage" | "voice"
+local last_stage_topic = {}   -- guild_id -> last topic string sent (dedup)
+
+local function get_channel_kind(channel_id)
+  if not channel_id then return "voice" end
+  local cached = channel_kind_cache[channel_id]
+  if cached then return cached end
+  local ch = bot.rest:get("/channels/" .. tostring(channel_id))
+  local kind = (ch and ch.type == 13) and "stage" or "voice"
+  channel_kind_cache[channel_id] = kind
+  return kind
+end
+
+local function update_stage_topic(guild_id, channel_id, title)
+  if not channel_id then return end
+  local ok, err = pcall(function()
+    local safe_title = tostring(title or "Unknown Track"):gsub("\n", " "):sub(1, 60)
+    local topic = "\xF0\x9F\x8E\xB5 " .. safe_title
+    if last_stage_topic[guild_id] == topic then return end
+    if get_channel_kind(channel_id) == "stage" then
+      local patched = bot.rest:patch("/stage-instances/" .. tostring(channel_id), { topic = topic })
+      if not patched then
+        bot.rest:post("/stage-instances", { channel_id = tostring(channel_id), topic = topic, privacy_level = 2 })
+      end
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = topic })
+    end
+    last_stage_topic[guild_id] = topic
+  end)
+  if not ok then io.stderr:write(("[symphony] stage/voice topic update failed for %s: %s\n"):format(tostring(guild_id), tostring(err))) end
+end
+
+local function clear_stage_topic(guild_id, channel_id)
+  last_stage_topic[guild_id] = nil
+  if not channel_id then return end
+  pcall(function()
+    if get_channel_kind(channel_id) == "stage" then
+      bot.rest:delete("/stage-instances/" .. tostring(channel_id))
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = cjson.null })
+    end
+  end)
+end
+
 local process_queue -- forward decl
 
 local function play_row(guild, guild_id, channel_id, row, settings, depth)
@@ -820,6 +869,7 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
     if nxt then return play_row(guild, guild_id, channel_id, nxt, settings, depth + 1) end
     clear_playback_state(guild_id)
     playback[guild_id] = nil
+    clear_stage_topic(guild_id, channel_id)
     return
   end
 
@@ -837,6 +887,7 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
   })
 
   local title = row.title or (track.info and track.info.title) or "Unknown Track"
+  update_stage_topic(guild_id, channel_id, title)
   playback[guild_id] = {
     url = row.video_url, title = title, requester_id = row.requester_id, track_uid = row.track_uid,
     channel_id = channel_id, duration_ms = track.info and track.info.length or 0,
@@ -878,6 +929,7 @@ process_queue = function(guild_id, channel_id, opts)
     if not row then
       clear_playback_state(guild_id)
       playback[guild_id] = nil
+      clear_stage_topic(guild_id, channel_id)
       return
     end
     play_row({ id = guild_id }, guild_id, channel_id, row, settings, 0)
@@ -885,6 +937,7 @@ process_queue = function(guild_id, channel_id, opts)
 end
 
 local function stop_playback(guild_id)
+  clear_stage_topic(guild_id, playback[guild_id] and playback[guild_id].channel_id or get_home_channel_id(guild_id))
   playback[guild_id] = nil
   clear_playback_state(guild_id)
   Q("DELETE FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
@@ -2290,6 +2343,30 @@ elseif env("SYMPHONY_DRY_RUN") then
   end)()))
   os.exit(0)
 end
+
+-- Rejoin and resume for any guild that was playing (or had a non-empty
+-- queue) when this process last stopped -- container recreates/restarts
+-- otherwise leave the bot sitting disconnected with a full queue and no
+-- way back in short of a manual /play.
+bot.gateway:on("READY", function()
+  copas.addthread(function()
+    copas.sleep(2) -- let the gateway session settle before opening voice
+    local rows = Q("SELECT DISTINCT guild_id FROM symphony_bot_home_channels WHERE bot_name = 'symphony'") or {}
+    for _, row in ipairs(rows) do
+      local gid = row.guild_id
+      local channel_id = get_home_channel_id(gid)
+      if channel_id then
+        local has_queue = queue_count(gid) > 0
+        local wp_rows = Q("SELECT is_playing FROM symphony_playback_state WHERE guild_id = %s AND bot_name = 'symphony'", gid)
+        local was_playing = wp_rows and wp_rows[1]
+        if has_queue or (was_playing and was_playing.is_playing) then
+          print(("[symphony] [%s] resuming on boot (queue=%s, was_playing=%s)"):format(tostring(gid), tostring(has_queue), tostring(was_playing and was_playing.is_playing)))
+          process_queue(gid, channel_id)
+        end
+      end
+    end
+  end)
+end)
 
 bot:run()
 
