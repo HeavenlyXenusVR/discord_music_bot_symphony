@@ -158,12 +158,29 @@ local function idisplay(interaction)
   return (u.global_name and u.global_name ~= cjson.null and u.global_name) or u.username or "Unknown"
 end
 
+local guild_owner_cache = {} -- guild_id -> owner user_id
+
+local function get_guild_owner_id(guild_id)
+  if not guild_id then return nil end
+  local cached = guild_owner_cache[guild_id]
+  if cached then return cached end
+  local g = bot.rest:get("/guilds/" .. tostring(guild_id))
+  local owner_id = g and g.owner_id
+  if owner_id then guild_owner_cache[guild_id] = owner_id end
+  return owner_id
+end
+
 local function has_admin(interaction)
   local perms = interaction.member and interaction.member.permissions
-  if not perms then return false end
-  local v = tonumber(perms)
-  if not v then return false end
-  return (math.floor(v / 0x8) % 2) == 1
+  local v = perms and tonumber(perms)
+  if v and (math.floor(v / 0x8) % 2) == 1 then return true end
+  -- The guild owner always effectively has admin, but Discord's resolved
+  -- member.permissions bitfield on the interaction has been observed to not
+  -- reliably reflect that -- fall back to an explicit ownership check
+  -- rather than ever locking the actual owner out of admin-gated commands.
+  local uid = interaction.member and interaction.member.user and interaction.member.user.id
+  local owner_id = uid and get_guild_owner_id(interaction.guild_id)
+  return owner_id ~= nil and tostring(owner_id) == tostring(uid)
 end
 
 local function new_track_uid()
