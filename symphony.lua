@@ -637,6 +637,8 @@ local function restore_queue_from_backup(guild_id)
   return n
 end
 
+
+
 -- Fisher-Yates shuffle, optionally keeping the current head (currently-playing-adjacent
 -- slot) fixed in place -- mirrors symphony.py's preserve_first behavior.
 local function shuffle_queue_rows(guild_id, preserve_first)
@@ -660,6 +662,252 @@ local function shuffle_queue_rows(guild_id, preserve_first)
     insert_queue_end(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
   end
   return #rows
+end
+
+-- ===========================================================================
+-- Live playlist sync: auto-add newly appeared tracks / auto-remove tracks
+-- gone from a queued playlist's source. Ported from alucard.py's
+-- playlist_sync_loop -- this was cut fleet-wide during the Lua rewrite
+-- (symphony_active_playlists existed only as inert per-guild metadata,
+-- written to by nothing but the DELETE calls scattered through /stop,
+-- /clear, sleep-timer-elapsed, and queue-drained; is_playlist_url() was
+-- defined but never called). Simplified vs. the Python original: no
+-- YouTube Data API path (this stack only has Lavalink), so every
+-- re-extraction is treated as equally trustworthy and a removal always
+-- requires 2 consecutive missing cycles rather than distinguishing an
+-- "API-trusted" cycle from a truncating-fallback one.
+-- ===========================================================================
+
+local PLAYLIST_SYNC_INTERVAL = tonumber(env("PLAYLIST_SYNC_INTERVAL", "30")) or 30
+local PLAYLIST_SYNC_MAX_TRACKED = tonumber(env("PLAYLIST_SYNC_MAX_TRACKED", "500")) or 500
+local PLAYLIST_QUEUE_MIN_TRACKS = tonumber(env("PLAYLIST_QUEUE_MIN_TRACKS", "20")) or 20
+local playlist_missing_streak = {} -- guild_id -> {track_key -> consecutive cycles missing}
+
+local function clear_active_playlist(guild_id)
+  Q("DELETE FROM symphony_active_playlists WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
+  Q("DELETE FROM symphony_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- Reuses this file's own url_key() (an 8-hex-char FNV-1a hash, same one
+-- bump_track_intelligence() already uses) instead of a raw truncated
+-- string -- it fits symphony_active_playlist_tracks.track_key's CHAR(40)
+-- column with room to spare, unlike some other bots' playlist_track_key()
+-- helpers that had to truncate a URL/title to fit (and got that truncation
+-- wrong at least once, tripping the pg.lua reconnect-storm bug fixed
+-- above). CHAR (not VARCHAR) still blank-pads on read, so values coming
+-- back out of this column need trimming before comparing them.
+local function playlist_track_key(url, title)
+  return url_key(url, title)
+end
+
+local function trim(s)
+  return (tostring(s or ""):gsub("%s+$", ""))
+end
+
+-- Called right after a /play (or equivalent) call resolves to a real
+-- Lavalink loadType=playlist response -- registers it so playlist_sync_tick
+-- starts watching it for adds/removals.
+local function set_active_playlist(guild_id, playlist_url, entries, requester_id, channel_id)
+  if not playlist_url or not entries or #entries == 0 then return end
+  Q([[INSERT INTO symphony_active_playlists (guild_id, bot_name, playlist_url, known_track_count, requester_id, channel_id)
+      VALUES (%s, 'symphony', %s, %s, %s, %s)
+      ON CONFLICT (guild_id, bot_name) DO UPDATE SET playlist_url = EXCLUDED.playlist_url,
+        known_track_count = EXCLUDED.known_track_count, requester_id = EXCLUDED.requester_id, channel_id = EXCLUDED.channel_id]],
+    guild_id, playlist_url, math.min(#entries, PLAYLIST_SYNC_MAX_TRACKED), requester_id, channel_id)
+  Q("DELETE FROM symphony_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
+  for idx, t in ipairs(entries) do
+    if idx > PLAYLIST_SYNC_MAX_TRACKED then break end
+    Q([[INSERT INTO symphony_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+        VALUES (%s, 'symphony', %s, %s, %s, %s, %s, %s, %s)]],
+      guild_id, playlist_url, idx - 1, playlist_track_key(t.uri, t.title), new_track_uid(), t.uri, t.title, requester_id)
+  end
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- One sync cycle across every guild with a registered active playlist:
+-- re-extracts each playlist via Lavalink, multiset-diffs it against the
+-- last-known snapshot (symphony_active_playlist_tracks), enqueues additions,
+-- and removes tracks that have been missing for 2 consecutive cycles
+-- (from both the live queue and its backup mirror) -- plus a loop-mode
+-- duplicate trim and a queue-health refill, matching the Python original.
+local function playlist_sync_tick()
+  local playlists = Q("SELECT guild_id, playlist_url, known_track_count, requester_id, channel_id FROM symphony_active_playlists WHERE bot_name = 'symphony'") or {}
+  for _, prow in ipairs(playlists) do
+    local gid = prow.guild_id
+    local ok, err = pcall(function()
+      local result, lerr = bot.lavalink:load_tracks(prow.playlist_url)
+      if not result or result.loadType == "error" or result.loadType == "empty" then
+        log_warn("[%s] playlist sync: re-extract failed: %s", gid, tostring((result and result.data and result.data.message) or lerr or "no response"))
+        return
+      end
+      local raw_entries = (result.loadType == "playlist") and ((result.data and result.data.tracks) or {}) or {}
+      local entries = {}
+      for _, t in ipairs(raw_entries) do
+        local uri = t.info and t.info.uri or t.uri
+        local title = t.info and t.info.title or t.title
+        if uri then entries[#entries + 1] = { uri = uri, title = title } end
+      end
+      if #entries == 0 then
+        log_warn("[%s] playlist sync: re-extract returned no tracks", gid)
+        return
+      end
+      if #entries > PLAYLIST_SYNC_MAX_TRACKED then
+        local trimmed = {}
+        for i = 1, PLAYLIST_SYNC_MAX_TRACKED do trimmed[i] = entries[i] end
+        entries = trimmed
+      end
+
+      local current_rows = {}
+      local current_counts = {}
+      for _, t in ipairs(entries) do
+        local k = playlist_track_key(t.uri, t.title)
+        current_rows[#current_rows + 1] = { url = t.uri, title = t.title, key = k }
+        current_counts[k] = (current_counts[k] or 0) + 1
+      end
+
+      local previous_rows = Q("SELECT track_key, track_uid, video_url, title, requester_id FROM symphony_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'symphony' ORDER BY position_idx ASC", gid) or {}
+      local previous_by_key = {}
+      local remaining_previous = {}
+      for _, p in ipairs(previous_rows) do
+        local k = trim(p.track_key or "")
+        previous_by_key[k] = previous_by_key[k] or {}
+        table.insert(previous_by_key[k], p)
+        remaining_previous[k] = (remaining_previous[k] or 0) + 1
+      end
+
+      local added_rows = {}
+      for _, r in ipairs(current_rows) do
+        if remaining_previous[r.key] and remaining_previous[r.key] > 0 then
+          remaining_previous[r.key] = remaining_previous[r.key] - 1
+        else
+          added_rows[#added_rows + 1] = r
+        end
+      end
+
+      local removed_counts = {}
+      local carry_forward = {}
+      local streaks = playlist_missing_streak[gid] or {}
+      for k, missing_n in pairs(remaining_previous) do
+        if missing_n > 0 then
+          local streak = (streaks[k] or 0) + 1
+          streaks[k] = streak
+          if streak >= 2 then
+            removed_counts[k] = missing_n
+          else
+            for i = 1, missing_n do
+              local p = previous_by_key[k] and previous_by_key[k][i]
+              if p then carry_forward[#carry_forward + 1] = p end
+            end
+          end
+        end
+      end
+      for k in pairs(current_counts) do streaks[k] = nil end
+      playlist_missing_streak[gid] = next(streaks) and streaks or nil
+
+      local purged_live, purged_backup = 0, 0
+      if next(removed_counts) ~= nil then
+        local budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local live_rows = Q("SELECT id, video_url, title FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony' ORDER BY id ASC", gid) or {}
+        for _, lr in ipairs(live_rows) do
+          local k = playlist_track_key(lr.video_url, lr.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            Q("DELETE FROM symphony_queue WHERE id = %s AND guild_id = %s AND bot_name = 'symphony'", lr.id, gid)
+            purged_live = purged_live + 1
+          end
+        end
+        budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local backup_rows = Q("SELECT id, video_url, title FROM symphony_queue_backup WHERE guild_id = %s AND bot_name = 'symphony' ORDER BY id ASC", gid) or {}
+        for _, br in ipairs(backup_rows) do
+          local k = playlist_track_key(br.video_url, br.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            Q("DELETE FROM symphony_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'symphony'", br.id, gid)
+            purged_backup = purged_backup + 1
+          end
+        end
+      end
+
+      if #added_rows > 0 then
+        for _, r in ipairs(added_rows) do insert_queue_end(gid, r.url, r.title, prow.requester_id) end
+        snapshot_queue_backup(gid)
+        if #added_rows > 1 then shuffle_queue_rows(gid, true) end
+      end
+
+      -- Trim loop-mode duplicate live-queue copies down to at most 1 per track_key still in the playlist.
+      local trim_count = 0
+      local current_keys = {}
+      for _, r in ipairs(current_rows) do current_keys[r.key] = true end
+      local all_rows = Q("SELECT id, video_url, title FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony' ORDER BY id ASC", gid) or {}
+      local seen = {}
+      for _, qr in ipairs(all_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if current_keys[k] then
+          if seen[k] then
+            Q("DELETE FROM symphony_queue WHERE id = %s AND guild_id = %s AND bot_name = 'symphony'", qr.id, gid)
+            trim_count = trim_count + 1
+          else
+            seen[k] = true
+          end
+        end
+      end
+
+      -- Queue-health refill: independent of the diff above, top the live queue back up
+      -- if it's thinner than expected relative to the tracked playlist (drained by
+      -- playback/a bug/a restart without the source playlist itself changing).
+      local refilled = 0
+      local queued_rows = Q("SELECT video_url, title FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony'", gid) or {}
+      local queued_keys = {}
+      local queued_n = 0
+      for _, qr in ipairs(queued_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if not queued_keys[k] then queued_keys[k] = true; queued_n = queued_n + 1 end
+      end
+      local target = math.min(#current_rows, PLAYLIST_QUEUE_MIN_TRACKS)
+      if queued_n < target then
+        local refill_rows = {}
+        for _, r in ipairs(current_rows) do
+          if queued_n + #refill_rows >= target then break end
+          if not queued_keys[r.key] then refill_rows[#refill_rows + 1] = r end
+        end
+        for _, r in ipairs(refill_rows) do insert_queue_end(gid, r.url, r.title, prow.requester_id) end
+        if #refill_rows > 0 then
+          refilled = #refill_rows
+          snapshot_queue_backup(gid)
+          shuffle_queue_rows(gid, true)
+        end
+      end
+
+      if #added_rows > 0 or purged_live > 0 or purged_backup > 0 or trim_count > 0 or refilled > 0 then
+        log_info("[%s] playlist sync: +%d -%d(live) -%d(backup) trimmed=%d refilled=%d", gid, #added_rows, purged_live, purged_backup, trim_count, refilled)
+      end
+
+      -- Persist this cycle's confirmed tracks plus anything still in its missing-streak
+      -- grace window as the baseline the next cycle diffs against.
+      Q("DELETE FROM symphony_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'symphony'", gid)
+      local idx = 0
+      for _, r in ipairs(current_rows) do
+        Q([[INSERT INTO symphony_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'symphony', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, r.key, new_track_uid(), r.url, r.title, prow.requester_id)
+        idx = idx + 1
+      end
+      for _, p in ipairs(carry_forward) do
+        Q([[INSERT INTO symphony_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'symphony', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, trim(p.track_key or ""), (trim(p.track_uid or "") ~= "" and trim(p.track_uid) or new_track_uid()), p.video_url, p.title, p.requester_id)
+        idx = idx + 1
+      end
+      Q("UPDATE symphony_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'symphony'", idx, gid)
+    end)
+    if not ok then
+      log_warn("[%s] playlist sync tick error: %s", gid, tostring(err))
+      report_error(gid, "runtime", "playlist sync error", tostring(err))
+    end
+  end
 end
 
 -- ============================================================================
@@ -1009,6 +1257,7 @@ local function stop_playback(guild_id)
   clear_stage_topic(guild_id, playback[guild_id] and playback[guild_id].channel_id or get_home_channel_id(guild_id))
   playback[guild_id] = nil
   clear_playback_state(guild_id)
+  clear_active_playlist(guild_id)
   Q("DELETE FROM symphony_queue WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
   Q("DELETE FROM symphony_queue_backup WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
   Q([[UPDATE symphony_voice_state SET desired_connected = FALSE, connected_channel_id = NULL,
@@ -1331,6 +1580,15 @@ cmd("play", "Queue a track, URL, livestream, search result, or playlist and star
       bump_user_affinity(interaction.guild_id, requester_id, uri, title, "queued_count")
     end
     if #entries > 1 then shuffle_queue_rows(interaction.guild_id, true) end
+    if playlist_info and is_playlist_url(search) then
+      local norm = {}
+      for _, track in ipairs(entries) do
+        local uri = track.info and track.info.uri or track.uri
+        local title = track.info and track.info.title or track.title
+        if uri then norm[#norm + 1] = { uri = uri, title = title } end
+      end
+      set_active_playlist(interaction.guild_id, search, norm, requester_id, channel_id)
+    end
     snapshot_queue_backup(interaction.guild_id)
     local q_len = queue_count(interaction.guild_id)
 
@@ -2426,6 +2684,56 @@ end
 -- actually written for).
 local did_initial_ready = false
 
+-- SwarmPanel's control.lua also writes uppercase PLAY/RECOVER/LEAVE/SEEK
+-- rows to symphony_swarm_direct_orders for source_url plays, fleet-
+-- supervisor recovery, forced disconnects, and seek-to-position -- none of
+-- the simpler symphony_swarm_overrides poller above covers these.
+local function handle_direct_order(order)
+  local guild_id = tostring(order.guild_id)
+  local cmd = order.command
+  local ok, err = pcall(function()
+    if cmd == "PLAY" and order.data and order.vc_id and order.vc_id ~= "0" then
+      local entries, terr = search_playables(order.data)
+      if not entries or #entries == 0 then error("could not resolve source: " .. tostring(terr), 0) end
+      for _, track in ipairs(entries) do
+        local uri = track.info and track.info.uri or track.uri
+        local title = track.info and track.info.title or track.title or "Unknown Track"
+        insert_queue_end(guild_id, uri, title, nil)
+      end
+      if #entries > 1 then shuffle_queue_rows(guild_id, true) end
+      snapshot_queue_backup(guild_id)
+      local d = playback[guild_id]
+      if not (d and d.active) then process_queue(guild_id, order.vc_id) end
+    elseif cmd == "RECOVER" then
+      local channel_id = (order.vc_id and order.vc_id ~= "0" and order.vc_id) or get_home_channel_id(guild_id)
+      local d = playback[guild_id]
+      if channel_id and not (d and d.active) then process_queue(guild_id, channel_id) end
+    elseif cmd == "LEAVE" then
+      stop_playback(guild_id)
+    elseif cmd == "SEEK" and order.data then
+      local target_seconds = math.max(0, tonumber(order.data) or 0)
+      local d = playback[guild_id]
+      if d and d.active then
+        bot.lavalink:seek(guild_id, target_seconds * 1000)
+      end
+    end
+  end)
+  if not ok then
+    Q("UPDATE symphony_swarm_direct_orders SET attempts = attempts + 1, last_error = %s WHERE id = %s", tostring(err):sub(1, 500), order.id)
+  else
+    Q("DELETE FROM symphony_swarm_direct_orders WHERE id = %s", order.id)
+    print(("[symphony] Aria executed direct order %s in guild %s."):format(cmd, guild_id))
+  end
+end
+
+local function poll_direct_orders()
+  local rows = Q("SELECT id, guild_id, vc_id, text_channel_id, command, data FROM symphony_swarm_direct_orders WHERE bot_name = 'symphony' AND claimed_at IS NULL ORDER BY id ASC LIMIT 5") or {}
+  for _, order in ipairs(rows) do
+    Q("UPDATE symphony_swarm_direct_orders SET claimed_at = NOW() WHERE id = %s", order.id)
+    handle_direct_order(order)
+  end
+end
+
 bot.gateway:on("READY", function()
   if did_initial_ready then return end
   did_initial_ready = true
@@ -2501,6 +2809,28 @@ bot.gateway:on("READY", function()
       end
     end
   end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(5)
+      local ok, err = pcall(poll_direct_orders)
+      if not ok then
+        print("[symphony] direct order poll error: " .. tostring(err))
+        report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(PLAYLIST_SYNC_INTERVAL)
+      local ok, err = pcall(playlist_sync_tick)
+      if not ok then
+        print("[symphony] playlist sync tick error: " .. tostring(err))
+        report_error(nil, "runtime", "playlist sync tick error", tostring(err))
+      end
+    end
+  end)
 end)
 
 bot:run()
@@ -2525,8 +2855,9 @@ bot:run()
     copas coroutines are cooperative so the in-process command handlers
     already serialize per-guild queue mutations well enough for this scale;
     see with_guild_lock).
-  - The Aria direct-order swarm bridge (symphony_swarm_direct_orders /
-    symphony_swarm_overrides claim-token job queue) is not ported.
+  - The Aria direct-order swarm bridge (symphony_swarm_direct_orders) is
+    ported (see poll_direct_orders/handle_direct_order); symphony_swarm_overrides
+    is the separate simpler claim-token job queue also handled above.
   - The deep resilience state machine (persistent-voice-restore-on-startup
     background loop, watchdog stall/revival counters, voice reconnect backoff
     tuning, periodic scheduled restarts, zombie reaper, continuous
