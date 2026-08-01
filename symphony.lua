@@ -41,6 +41,58 @@ local function env(name, default)
   return v
 end
 
+-- File-based logging was entirely missing from this bot (stdout-only, so
+-- anything not caught live via `docker logs` was gone on the next log
+-- rotation/restart) -- unlike alucard.py's RotatingFileHandler, which every
+-- Python-era bot had. Rather than hand-migrate every existing print() call
+-- site (large, error-prone for one pass), print itself is wrapped here so
+-- every call -- old and new -- is transparently timestamped, tagged, and
+-- persisted to a rotating file (same 10MB x 5 backups policy as the other
+-- bots' logline()/LOG_FILE and Lavalink's logback config), with zero change
+-- to any call site's behavior or arguments.
+local LOG_DIR = env("SYMPHONY_LOG_DIR", env("MUSIC_BOT_LOG_DIR", "/app/logs"))
+pcall(function() os.execute("mkdir -p '" .. LOG_DIR .. "'") end)
+local LOG_FILE = LOG_DIR .. "/symphony.log"
+local LOG_MAX_BYTES = tonumber(env("MUSIC_BOT_LOG_MAX_BYTES", "10485760")) or 10485760
+local LOG_BACKUP_COUNT = tonumber(env("MUSIC_BOT_LOG_BACKUP_COUNT", "5")) or 5
+
+local function rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local size = f:seek("end")
+  f:close()
+  if not size or size < LOG_MAX_BYTES then return end
+  for i = LOG_BACKUP_COUNT - 1, 1, -1 do
+    os.rename(LOG_FILE .. "." .. i, LOG_FILE .. "." .. (i + 1))
+  end
+  os.rename(LOG_FILE, LOG_FILE .. ".1")
+end
+
+local raw_print = print
+local function logline(level, fmt, ...)
+  local ok, msg = pcall(string.format, fmt, ...)
+  if not ok then msg = fmt end
+  local line = string.format("%s %-5s symphony %s", os.date("%Y-%m-%d %H:%M:%S"), level, msg)
+  raw_print(line)
+  rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "a")
+  if f then f:write(line .. "\n"); f:close() end
+end
+local function log_info(fmt, ...) logline("INFO", fmt, ...) end
+local function log_warn(fmt, ...) logline("WARN", fmt, ...) end
+local function log_error(fmt, ...) logline("ERROR", fmt, ...) end
+
+-- Existing print("[bot] message") calls throughout this file already embed
+-- their own tag/timestamp-free format; route them through the same
+-- rotating file (tagged INFO, since plain print() carries no level) instead
+-- of rewriting every call site.
+print = function(...)
+  local n = select("#", ...)
+  local parts = {{}}
+  for i = 1, n do parts[i] = tostring((select(i, ...))) end
+  logline("INFO", "%s", table.concat(parts, "\t"))
+end
+
 local TOKEN = env(BOT_ENV_PREFIX .. "_DISCORD_TOKEN", "")
 if TOKEN == "" then
   io.stderr:write("[symphony] " .. BOT_ENV_PREFIX .. "_DISCORD_TOKEN is not set; refusing to start.\n")
@@ -2365,7 +2417,18 @@ end
 -- queue) when this process last stopped -- container recreates/restarts
 -- otherwise leave the bot sitting disconnected with a full queue and no
 -- way back in short of a manual /play.
+-- BUGFIX: the Discord gateway sends a fresh READY (not RESUMED) on every
+-- invalidated session -- routine reconnects, not just process restarts --
+-- and this handler used to redo its full boot-resume/background-loop-spawn
+-- pass every single time, which both force-restarted/discarded queued
+-- tracks on reconnect and piled up duplicate background loops. Gate on
+-- did_initial_ready so it runs exactly once per process (matching what it was
+-- actually written for).
+local did_initial_ready = false
+
 bot.gateway:on("READY", function()
+  if did_initial_ready then return end
+  did_initial_ready = true
   copas.addthread(function()
     -- Wait for the Lavalink websocket to actually be connected before
     -- touching the queue -- process_queue deletes each row before resolving
@@ -2389,6 +2452,52 @@ bot.gateway:on("READY", function()
           print(("[symphony] [%s] resuming on boot (queue=%s, was_playing=%s)"):format(tostring(gid), tostring(has_queue), tostring(was_playing and was_playing.is_playing)))
           process_queue(gid, channel_id)
         end
+      end
+    end
+  end)
+
+  -- SwarmPanel/Aria remote-control bridge -- was entirely missing, so the
+  -- panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons silently did nothing for
+  -- this bot. Same poll-and-execute-then-delete pattern as alucard.lua/
+  -- gws.lua/sapphire.lua, adapted to symphony's Q()/sync_pause_state().
+  copas.addthread(function()
+    while true do
+      copas.sleep(10)
+      local ok, err = pcall(function()
+        local rows = Q("SELECT guild_id, command FROM symphony_swarm_overrides WHERE bot_name = 'symphony'") or {}
+        for _, row in ipairs(rows) do
+          local guild_id = tostring(row.guild_id)
+          local cmd_name = (row.command or ""):upper()
+          local d = playback[guild_id]
+          local executed = false
+          if cmd_name == "RESTART" then
+            Q("DELETE FROM symphony_swarm_overrides WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
+            print("[symphony] Aria requested a restart.")
+            os.exit(0)
+          elseif cmd_name == "PAUSE" and d and d.active and not d.paused then
+            bot.lavalink:set_paused(guild_id, true)
+            sync_pause_state(guild_id, true)
+            executed = true
+          elseif cmd_name == "RESUME" and d and d.active and d.paused then
+            bot.lavalink:set_paused(guild_id, false)
+            sync_pause_state(guild_id, false)
+            executed = true
+          elseif cmd_name == "SKIP" and d and d.active then
+            bot.lavalink:stop(guild_id)
+            executed = true
+          elseif cmd_name == "STOP" then
+            stop_playback(guild_id)
+            executed = true
+          end
+          if executed then
+            print(("[symphony] Aria executed %s in guild %s."):format(cmd_name, guild_id))
+          end
+          Q("DELETE FROM symphony_swarm_overrides WHERE guild_id = %s AND bot_name = 'symphony' AND command = %s", guild_id, row.command)
+        end
+      end)
+      if not ok then
+        print("[symphony] swarm override poll error: " .. tostring(err))
+        report_error(nil, "runtime", "swarm override poll error", tostring(err))
       end
     end
   end)
