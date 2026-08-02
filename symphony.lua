@@ -1105,13 +1105,18 @@ local function join_and_wait_for_voice(guild_id, channel_id)
   bot.gateway:join_voice(guild_id, channel_id, false, true)
   persist_voice_state(guild_id, channel_id, true)
   local waited = 0
+  local ready = false
   while waited < 8 do
     local vs = bot.voice_state[guild_id]
-    if vs and vs.session_id then break end
+    if vs and vs.session_id then ready = true; break end
     copas.sleep(0.25)
     waited = waited + 0.25
   end
   copas.sleep(0.4) -- give VOICE_SERVER_UPDATE -> Lavalink a moment to land
+  -- Used to return nothing, so callers had no way to notice a timed-out
+  -- handshake -- update_player() below was never checked either, so a
+  -- failed/never-established voice link looked identical to success.
+  return ready
 end
 
 -- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
@@ -1180,7 +1185,11 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
     return
   end
 
-  join_and_wait_for_voice(guild_id, channel_id)
+  if not join_and_wait_for_voice(guild_id, channel_id) then
+    io.stderr:write(("[symphony] [%s] Voice connection unavailable; requeueing '%s'\n"):format(tostring(guild_id), tostring(row.title)))
+    insert_queue_front(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
+    return
+  end
 
   local retry_key = guild_id .. ":" .. tostring(row.track_uid or row.video_url)
   local result, err = bot.lavalink:load_tracks(row.video_url)
@@ -1215,12 +1224,17 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
     speed = settings.custom_speed or 1.0
   end
 
-  bot.lavalink:update_player(guild_id, {
+  local play_ok, play_err = bot.lavalink:update_player(guild_id, {
     encodedTrack = track.encoded,
     volume = settings.volume or 100,
     paused = false,
     filters = filters,
   })
+  if not play_ok then
+    io.stderr:write(("[symphony] [%s] Playback start failed for '%s': %s\n"):format(tostring(guild_id), tostring(row.title), tostring(play_err)))
+    insert_queue_front(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
+    return
+  end
 
   local title = row.title or (track.info and track.info.title) or "Unknown Track"
   update_stage_topic(guild_id, channel_id, title)
@@ -2871,7 +2885,14 @@ bot.gateway:on("READY", function()
           if executed then
             print(("[symphony] Aria executed %s in guild %s."):format(cmd_name, guild_id))
           end
-          Q("DELETE FROM symphony_swarm_overrides WHERE guild_id = %s AND bot_name = 'symphony' AND command = %s", guild_id, row.command)
+          -- Only clear the override once it actually ran -- it used to be
+          -- deleted unconditionally, so a command whose guard didn't match yet
+          -- (e.g. PAUSE arriving before playback[guild_id] was populated, a real
+          -- race right after a container restart) was silently dropped forever
+          -- instead of being retried on the next poll.
+          if executed then
+            Q("DELETE FROM symphony_swarm_overrides WHERE guild_id = %s AND bot_name = 'symphony' AND command = %s", guild_id, row.command)
+          end
         end
       end)
       if not ok then
