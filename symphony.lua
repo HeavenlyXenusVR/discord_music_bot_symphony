@@ -1165,6 +1165,14 @@ end
 
 local process_queue -- forward decl
 
+-- guild_id..":"..track_uid -> consecutive resolve-failure count. A Lavalink/
+-- network blip mid-drain used to permanently delete every remaining queued
+-- track (each dequeued row was gone before load_tracks even ran, and a
+-- failed resolve just deleted the backup copy and moved to the next row),
+-- so a short outage could wipe an entire queue in seconds.
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 local function play_row(guild, guild_id, channel_id, row, settings, depth)
   depth = depth or 0
   if depth > 3 then
@@ -1174,13 +1182,23 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
 
   join_and_wait_for_voice(guild_id, channel_id)
 
+  local retry_key = guild_id .. ":" .. tostring(row.track_uid or row.video_url)
   local result, err = bot.lavalink:load_tracks(row.video_url)
   local track = result and (result.loadType == "track" and result.data
     or (result.loadType == "search" and result.data and result.data[1])
     or (result.loadType == "playlist" and result.data and result.data.tracks and result.data.tracks[1]))
 
   if not track then
-    io.stderr:write(("[symphony] failed to resolve queued track for guild %s: %s (%s)\n"):format(guild_id, row.title, tostring(err)))
+    local attempts = (resolve_attempts[retry_key] or 0) + 1
+    if attempts < MAX_RESOLVE_ATTEMPTS then
+      resolve_attempts[retry_key] = attempts
+      io.stderr:write(("[symphony] resolve failed for guild %s (attempt %d/%d): %s (%s) -- requeuing\n"):format(guild_id, attempts, MAX_RESOLVE_ATTEMPTS, row.title, tostring(err)))
+      insert_queue_front(guild_id, row.video_url, row.title, row.requester_id, row.track_uid)
+      return
+    end
+    resolve_attempts[retry_key] = nil
+    io.stderr:write(("[symphony] giving up on '%s' for guild %s after %d failed resolves: %s\n"):format(row.title, guild_id, attempts, tostring(err)))
+    report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(row.title, tostring(err)))
     delete_backup_track(guild_id, row.track_uid, row.video_url, row.title)
     local nxt = pop_next_queue_row(guild_id)
     if nxt then return play_row(guild, guild_id, channel_id, nxt, settings, depth + 1) end
@@ -1189,6 +1207,7 @@ local function play_row(guild, guild_id, channel_id, row, settings, depth)
     clear_stage_topic(guild_id, channel_id)
     return
   end
+  resolve_attempts[retry_key] = nil
 
   local filters, speed = build_filters(settings)
   if (settings.custom_modifiers_left or 0) > 0 then
@@ -1233,6 +1252,12 @@ process_queue = function(guild_id, channel_id, opts)
   opts = opts or {}
   local existing = playback[guild_id]
   if existing and existing.active and not opts.force then return end
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    -- Lavalink isn't connected right now -- leave the queue untouched
+    -- rather than dequeuing tracks we can't resolve; the watchdog thread
+    -- and the next natural trigger will retry once it's back.
+    return
+  end
 
   with_guild_lock(guild_id, function()
     local settings = get_settings(guild_id)
@@ -2726,6 +2751,18 @@ local function handle_direct_order(order)
   end
 end
 
+local function recovery_watchdog()
+  local stalled = Q("SELECT DISTINCT guild_id FROM symphony_queue WHERE bot_name = 'symphony'") or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not (playback[guild_id] and playback[guild_id].active) then
+      local vrows = Q("SELECT connected_channel_id FROM symphony_voice_state WHERE guild_id = %s AND bot_name = 'symphony'", guild_id)
+      local channel_id = (vrows and vrows[1] and vrows[1].connected_channel_id) or get_home_channel_id(guild_id)
+      if channel_id then process_queue(guild_id, channel_id) end
+    end
+  end
+end
+
 local function poll_direct_orders()
   local rows = Q("SELECT id, guild_id, vc_id, text_channel_id, command, data FROM symphony_swarm_direct_orders WHERE bot_name = 'symphony' AND claimed_at IS NULL ORDER BY id ASC LIMIT 5") or {}
   for _, order in ipairs(rows) do
@@ -2817,6 +2854,16 @@ bot.gateway:on("READY", function()
       if not ok then
         print("[symphony] direct order poll error: " .. tostring(err))
         report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+  copas.addthread(function()
+    while true do
+      copas.sleep(30)
+      local ok, err = pcall(recovery_watchdog)
+      if not ok then
+        print("[symphony] recovery_watchdog error: " .. tostring(err))
+        report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
       end
     end
   end)
